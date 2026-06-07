@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/sandertv/gophertunnel/minecraft/auth"
 	"github.com/Olavo635/donutsmp-proxy/proxy"
@@ -13,20 +16,32 @@ import (
 
 const tokenFile = "token.json"
 
+// Servidores predefinidos
+var presetServers = []proxy.Server{
+	{Name: "DonutSMP", Address: "donutsmp.net:19132"},
+	{Name: "Hypixel (Bedrock)", Address: "bedrock.hypixel.net:19132"},
+	{Name: "CubeCraft", Address: "play.cubecraft.net:19132"},
+	{Name: "Mineplex", Address: "pe.mineplex.com:19132"},
+	{Name: "Hive", Address: "geo.hivebedrock.network:19132"},
+	{Name: "FallenTech", Address: "fallentech.com.br:19132"},
+}
+
 func main() {
+	fmt.Print("\033[H\033[2J") // limpa terminal
 	fmt.Println(`
- ██████╗  ██████╗ ███╗   ██╗██╗   ██╗████████╗    ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
- ██╔══██╗██╔═══██╗████╗  ██║██║   ██║╚══██╔══╝    ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
- ██║  ██║██║   ██║██╔██╗ ██║██║   ██║   ██║       ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ 
- ██║  ██║██║   ██║██║╚██╗██║██║   ██║   ██║       ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝  
- ██████╔╝╚██████╔╝██║ ╚████║╚██████╔╝   ██║       ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   
- ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝ ╚═════╝    ╚═╝       ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝  
-                          para donutsmp.net — by Plot
+ ██████╗ ██╗         ██████╗ ██████╗  ██████╗ ██╗  ██╗██╗   ██╗
+ ██╔══██╗██║         ██╔══██╗██╔══██╗██╔═══██╗╚██╗██╔╝╚██╗ ██╔╝
+ ██████╔╝██║         ██████╔╝██████╔╝██║   ██║ ╚███╔╝  ╚████╔╝ 
+ ██╔═══╝ ██║         ██╔═══╝ ██╔══██╗██║   ██║ ██╔██╗   ╚██╔╝  
+ ██║     ███████╗    ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   
+ ╚═╝     ╚══════╝    ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝  
+                    PL Proxy — Bedrock Edition
 `)
 
+	// ── Auth ──────────────────────────────────────────────────
 	token, err := loadToken()
 	if err != nil {
-		fmt.Println("[auth] Nenhum token salvo encontrado. Fazendo login com conta Microsoft...")
+		fmt.Println("[auth] Nenhum token encontrado. Fazendo login com conta Microsoft...")
 		token, err = auth.RequestLiveToken()
 		if err != nil {
 			log.Fatalf("[auth] Falha no login: %v", err)
@@ -37,34 +52,72 @@ func main() {
 			fmt.Println("[auth] Token salvo em", tokenFile)
 		}
 	} else {
-		fmt.Println("[auth] Token carregado de", tokenFile)
+		fmt.Println("[auth] Login automático via token salvo.")
 	}
 
 	src := auth.RefreshTokenSource(token)
+	go persistToken(src)
 
-	// Ao renovar o token, persiste a versão atualizada
-	go watchAndPersistToken(src)
+	// ── Seleção de servidor ───────────────────────────────────
+	server := selectServer()
 
-	p := proxy.New(src)
+	fmt.Printf("\n[proxy] Conectando em: %s (%s)\n", server.Name, server.Address)
+
+	p := proxy.New(src, server)
 	if err := p.Start(); err != nil {
 		log.Fatalf("[proxy] Erro fatal: %v", err)
 	}
 }
 
-// loadToken tenta carregar o token OAuth2 do disco.
+func selectServer() proxy.Server {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Println("\n┌─────────────────────────────────┐")
+	fmt.Println("│       Selecione o servidor       │")
+	fmt.Println("├─────────────────────────────────┤")
+	for i, s := range presetServers {
+		fmt.Printf("│  [%d] %-28s│\n", i+1, s.Name)
+	}
+	fmt.Printf("│  [%d] %-28s│\n", len(presetServers)+1, "Servidor customizado")
+	fmt.Println("└─────────────────────────────────┘")
+	fmt.Print("\nOpção: ")
+
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(line)
+	n, err := strconv.Atoi(line)
+
+	if err != nil || n < 1 || n > len(presetServers)+1 {
+		fmt.Println("[!] Opção inválida, usando DonutSMP.")
+		return presetServers[0]
+	}
+
+	if n == len(presetServers)+1 {
+		fmt.Print("Endereço (ex: play.meuserver.com:19132): ")
+		addr, _ := reader.ReadString('\n')
+		addr = strings.TrimSpace(addr)
+		if addr == "" {
+			fmt.Println("[!] Endereço vazio, usando DonutSMP.")
+			return presetServers[0]
+		}
+		// Adiciona porta padrão se não informada
+		if !strings.Contains(addr, ":") {
+			addr += ":19132"
+		}
+		return proxy.Server{Name: "Custom", Address: addr}
+	}
+
+	return presetServers[n-1]
+}
+
 func loadToken() (*oauth2.Token, error) {
 	data, err := os.ReadFile(tokenFile)
 	if err != nil {
 		return nil, err
 	}
 	var t oauth2.Token
-	if err := json.Unmarshal(data, &t); err != nil {
-		return nil, err
-	}
-	return &t, nil
+	return &t, json.Unmarshal(data, &t)
 }
 
-// saveToken persiste o token OAuth2 em disco.
 func saveToken(t *oauth2.Token) error {
 	data, err := json.MarshalIndent(t, "", "  ")
 	if err != nil {
@@ -73,10 +126,7 @@ func saveToken(t *oauth2.Token) error {
 	return os.WriteFile(tokenFile, data, 0600)
 }
 
-// watchAndPersistToken observa renovações de token e as salva.
-func watchAndPersistToken(src oauth2.TokenSource) {
-	// A cada vez que o token for acessado e renovado, salvamos.
-	// Como gophertunnel usa o src internamente, salvamos o estado inicial.
+func persistToken(src oauth2.TokenSource) {
 	t, err := src.Token()
 	if err != nil {
 		return
