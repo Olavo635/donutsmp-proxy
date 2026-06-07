@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/sandertv/gophertunnel/minecraft/auth"
-	"github.com/Olavo635/donutsmp-proxy/proxy"
+	"github.com/Olavo635/plproxy/proxy"
 	"golang.org/x/oauth2"
 )
 
