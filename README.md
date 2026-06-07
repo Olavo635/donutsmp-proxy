@@ -1,7 +1,6 @@
 # 🍩 Donut Proxy
 
-Proxy MITM para Minecraft Bedrock Edition focado em jogadores do **donutsmp.net**.  
-Resolve problemas de incompatibilidade Geyser que impedem jogadores Bedrock de usar features Java.
+Proxy MITM para Minecraft Bedrock Edition focado em jogadores do **donutsmp.net**. 
 
 ## Funcionalidades
 
@@ -30,7 +29,7 @@ Aplica o efeito Night Vision **somente no seu client**. O servidor não vê nada
 
 ```bash
 git clone https://github.com/Olavo635/donutsmp-proxy
-cd donut-proxy
+cd donutsmp-proxy
 go mod tidy
 go build -o donut-proxy .
 ```
@@ -39,6 +38,7 @@ go build -o donut-proxy .
 
 1. **Execute o proxy:**
    ```bash
+   cd ~/donutsmp-proxy
    ./donut-proxy
    ```
 2. Na **primeira execução**, ele abrirá um link no terminal para autenticação Microsoft. Faça login e copie o código.
