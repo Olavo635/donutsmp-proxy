@@ -1,4 +1,4 @@
-module github.com/user/donut-proxy
+module github.com/Olavo635/donutsmp-proxy
 
 go 1.24
 
