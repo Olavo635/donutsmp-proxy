@@ -7,7 +7,7 @@ import (
 	"os"
 
 	"github.com/sandertv/gophertunnel/minecraft/auth"
-	"github.com/Olavo635/donutsmp-proxy"
+	"github.com/Olavo635/donutsmp-proxy/proxy"
 	"golang.org/x/oauth2"
 )
 
