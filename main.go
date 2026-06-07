@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/sandertv/gophertunnel/minecraft/auth"
+	"github.com/Olavo635/plproxy/lua"
 	"github.com/Olavo635/plproxy/proxy"
 	"golang.org/x/oauth2"
 )
@@ -36,6 +37,7 @@ func main() {
  ██║     ███████╗    ██║     ██║  ██║╚██████╔╝██╔╝ ██╗   ██║   
  ╚═╝     ╚══════╝    ╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝   ╚═╝  
                     PL Proxy — Bedrock Edition
+                    Lua Script Engine
 `)
 
 	// ── Auth ──────────────────────────────────────────────────
@@ -58,12 +60,16 @@ func main() {
 	src := auth.RefreshTokenSource(token)
 	go persistToken(src)
 
+	// ── Engine Lua ────────────────────────────────────────────
+	engine := lua.NewEngine()
+	fmt.Println("[lua] Engine Lua inicializado")
+
 	// ── Seleção de servidor ───────────────────────────────────
 	server := selectServer()
 
 	fmt.Printf("\n[proxy] Conectando em: %s (%s)\n", server.Name, server.Address)
 
-	p := proxy.New(src, server)
+	p := proxy.New(src, server, engine)
 	if err := p.Start(); err != nil {
 		log.Fatalf("[proxy] Erro fatal: %v", err)
 	}

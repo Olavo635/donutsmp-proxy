@@ -3,7 +3,7 @@ package proxy
 import (
 	"fmt"
 	"log"
-	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +12,7 @@ import (
 	"github.com/go-gl/mathgl/mgl32"
 	"github.com/sandertv/gophertunnel/minecraft"
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
+	"github.com/Olavo635/plproxy/lua"
 	"golang.org/x/oauth2"
 )
 
@@ -27,10 +28,11 @@ type Server struct {
 type Proxy struct {
 	src    oauth2.TokenSource
 	server Server
+	engine *lua.Engine
 }
 
-func New(src oauth2.TokenSource, server Server) *Proxy {
-	return &Proxy{src: src, server: server}
+func New(src oauth2.TokenSource, server Server, engine *lua.Engine) *Proxy {
+	return &Proxy{src: src, server: server, engine: engine}
 }
 
 func (p *Proxy) Start() error {
@@ -49,7 +51,7 @@ func (p *Proxy) Start() error {
 
 	fmt.Printf("[proxy] Escutando em %s → %s\n", localAddress, p.server.Address)
 	fmt.Println("[proxy] Conecte seu Minecraft Bedrock no endereço: 127.0.0.1:19132")
-	fmt.Println("[proxy] Digite .ajuda no chat para ver os comandos disponíveis")
+	fmt.Println("[proxy] Use .run <arquivo.lua> para carregar scripts")
 
 	for {
 		conn, err := listener.Accept()
@@ -86,7 +88,9 @@ func (p *Proxy) handleConn(client *minecraft.Conn, listener *minecraft.Listener)
 	}
 
 	fmt.Println("[proxy] Jogador conectado!")
-	newSession(client, serverConn, listener, p.server).run()
+	sess := newSession(client, serverConn, listener, p.server, p.engine)
+	p.engine.SetSession(sess)
+	sess.run()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -98,6 +102,7 @@ type session struct {
 	server   *minecraft.Conn
 	listener *minecraft.Listener
 	srvInfo  Server
+	engine   *lua.Engine
 
 	mu        sync.Mutex
 	stopping  atomic.Bool
@@ -111,25 +116,99 @@ type session struct {
 	savedYaw        float32
 	savedPitch      float32
 	entityRuntimeID uint64
-
-	// toggles
-	freecamActive bool
-	fullbrightOn  bool
-	nochatOn      bool
 }
 
-func newSession(client, server *minecraft.Conn, listener *minecraft.Listener, srv Server) *session {
+func newSession(client, server *minecraft.Conn, listener *minecraft.Listener, srv Server, engine *lua.Engine) *session {
 	gd := server.GameData()
 	return &session{
 		client:          client,
 		server:          server,
 		listener:        listener,
 		srvInfo:         srv,
+		engine:          engine,
 		connectedAt:     time.Now(),
 		savedGameMode:   gd.PlayerGameMode,
 		entityRuntimeID: gd.EntityRuntimeID,
 	}
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Interface Session (para o engine Lua)
+// ─────────────────────────────────────────────────────────────
+
+func (s *session) SendMessage(msg string) {
+	s.sendMessage(msg)
+}
+
+func (s *session) GetPosition() mgl32.Vec3 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.savedPosition
+}
+
+func (s *session) SetPosition(pos mgl32.Vec3) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	newPos := pos
+
+	// Teleporta no servidor
+	_ = s.server.WritePacket(&packet.MovePlayer{
+		EntityRuntimeID: s.entityRuntimeID,
+		Position:        newPos,
+		Mode:            packet.MoveModeTeleport,
+	})
+	// Atualiza cliente também
+	_ = s.client.WritePacket(&packet.MovePlayer{
+		EntityRuntimeID: s.entityRuntimeID,
+		Position:        newPos,
+		Mode:            packet.MoveModeTeleport,
+	})
+
+	s.savedPosition = newPos
+}
+
+func (s *session) GetYaw() float32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.savedYaw
+}
+
+func (s *session) GetPitch() float32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.savedPitch
+}
+
+func (s *session) GetGamemode() int32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.savedGameMode
+}
+
+func (s *session) GetEntityRuntimeID() uint64 {
+	return s.entityRuntimeID
+}
+
+func (s *session) GetServerName() string {
+	return s.srvInfo.Name
+}
+
+func (s *session) GetServerAddress() string {
+	return s.srvInfo.Address
+}
+
+func (s *session) SendPacketToClient(pk packet.Packet) error {
+	return s.client.WritePacket(pk)
+}
+
+func (s *session) SendPacketToServer(pk packet.Packet) error {
+	return s.server.WritePacket(pk)
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Loop principal
+// ─────────────────────────────────────────────────────────────
 
 func (s *session) run() {
 	done := make(chan struct{}, 2)
@@ -145,18 +224,9 @@ func (s *session) run() {
 			if s.handleClientPacket(pk) {
 				continue
 			}
-			if s.freecamActive {
-				switch pk.(type) {
-				case *packet.MovePlayer,
-					*packet.PlayerAuthInput,
-					*packet.Animate,
-					*packet.InventoryTransaction,
-					*packet.BlockPickRequest,
-					*packet.ActorPickRequest,
-					*packet.Interact,
-					*packet.PlayerAction:
-					continue
-				}
+			// Executa hooks Lua do cliente
+			if s.engine.ExecuteClientHooks(s, pk) {
+				continue
 			}
 			if err := s.server.WritePacket(pk); err != nil {
 				return
@@ -173,6 +243,10 @@ func (s *session) run() {
 				return
 			}
 			if s.handleServerPacket(pk) {
+				continue
+			}
+			// Executa hooks Lua do servidor
+			if s.engine.ExecuteServerHooks(s, pk) {
 				continue
 			}
 			if err := s.client.WritePacket(pk); err != nil {
@@ -195,19 +269,15 @@ func (s *session) handleClientPacket(pk packet.Packet) bool {
 			return true
 		}
 	case *packet.MovePlayer:
-		if !s.freecamActive {
-			s.mu.Lock()
-			s.savedPosition = p.Position
-			s.savedYaw = p.HeadYaw
-			s.savedPitch = p.Pitch
-			s.mu.Unlock()
-		}
+		s.mu.Lock()
+		s.savedPosition = p.Position
+		s.savedYaw = p.HeadYaw
+		s.savedPitch = p.Pitch
+		s.mu.Unlock()
 	case *packet.PlayerAuthInput:
-		if !s.freecamActive {
-			s.mu.Lock()
-			s.savedPosition = p.Position
-			s.mu.Unlock()
-		}
+		s.mu.Lock()
+		s.savedPosition = p.Position
+		s.mu.Unlock()
 	}
 	return false
 }
@@ -216,39 +286,12 @@ func (s *session) handleClientPacket(pk packet.Packet) bool {
 func (s *session) handleServerPacket(pk packet.Packet) bool {
 	switch p := pk.(type) {
 	case *packet.SetPlayerGameType:
-		if !s.freecamActive {
-			s.mu.Lock()
-			s.savedGameMode = p.GameType
-			s.mu.Unlock()
-		}
-	case *packet.Text:
 		s.mu.Lock()
-		nochat := s.nochatOn
+		s.savedGameMode = p.GameType
 		s.mu.Unlock()
-		if nochat && p.TextType != packet.TextTypeSystem {
-			return true
-		}
-	case *packet.SetTitle:
-		s.mu.Lock()
-		nochat := s.nochatOn
-		s.mu.Unlock()
-		if nochat {
-			return true
-		}
-	case *packet.BossEvent:
-		s.mu.Lock()
-		nochat := s.nochatOn
-		s.mu.Unlock()
-		if nochat {
-			return true
-		}
-	case *packet.PlaySound:
-		s.mu.Lock()
-		nochat := s.nochatOn
-		s.mu.Unlock()
-		if nochat && strings.Contains(p.SoundName, "note") {
-			return true
-		}
+	case *packet.NetworkStackLatency:
+		// Sempre consome pacotes de latência
+		return true
 	}
 	return false
 }
@@ -258,35 +301,33 @@ func (s *session) handleServerPacket(pk packet.Packet) bool {
 // ─────────────────────────────────────────────────────────────
 
 func (s *session) handleCommand(raw string) {
-	parts := strings.Fields(strings.ToLower(raw))
+	parts := strings.Fields(raw)
 	if len(parts) == 0 {
 		return
 	}
-	switch parts[0] {
+
+	cmdName := strings.ToLower(parts[0])
+	args := parts[1:]
+
+	switch cmdName {
 	case ".help", ".ajuda":
 		s.sendHelp()
-	case ".fullbright", ".fb":
-		s.toggleFullbright()
-	case ".freecam", ".fc":
-		s.toggleFreecam()
-	case ".nochat", ".nc":
-		s.toggleNochat()
-	case ".coords", ".co":
-		s.showCoords()
-	case ".ping":
-		s.showPing()
-	case ".time", ".hora":
-		s.showTime()
-	case ".uptime", ".up":
-		s.showUptime()
-	case ".clip", ".cl":
-		s.doClip(parts)
-	case ".server", ".srv":
-		s.showServer()
+	case ".run":
+		s.handleRun(args)
+	case ".debug":
+		s.handleDebug(args)
+	case ".ids":
+		s.handleIds()
 	case ".stop":
-		s.handleStop()
+		s.handleStopCommand(args)
 	default:
-		s.sendMessage(fmt.Sprintf("§cComando desconhecido: §e%s §c— use §e.ajuda§c para ver a lista.", parts[0]))
+		// Procura nos comandos registrados pelos scripts Lua
+		cmd := s.engine.GetCommand(strings.TrimPrefix(cmdName, "."))
+		if cmd != nil {
+			cmd.Handler(s, args)
+		} else {
+			s.sendMessage(fmt.Sprintf("§cComando desconhecido: §e%s §c— use §e.ajuda§c para ver a lista.", cmdName))
+		}
 	}
 }
 
@@ -295,213 +336,122 @@ func (s *session) handleCommand(raw string) {
 // ─────────────────────────────────────────────────────────────
 
 func (s *session) sendHelp() {
-	lines := []string{
-		"§b§l╔══════════════════════════════════════╗",
-		"§b§l║         §ePL Proxy §b— Comandos          §b§l║",
-		"§b§l╠══════════════════════════════════════╣",
-		"§b§l║ §e.ajuda §7/ §e.help      §fEsta tela",
-		"§b§l║ §e.fullbright §7/ §e.fb   §fToggle visão noturna",
-		"§b§l║ §e.freecam §7/ §e.fc     §fToggle câmera livre",
-		"§b§l║ §e.nochat §7/ §e.nc      §fToggle silenciar chat",
-		"§b§l║ §e.coords §7/ §e.co      §fMostra suas coordenadas",
-		"§b§l║ §e.ping           §fMostra o ping atual",
-		"§b§l║ §e.time §7/ §e.hora      §fHora atual do sistema",
-		"§b§l║ §e.uptime §7/ §e.up      §fTempo conectado",
-		"§b§l║ §e.clip [n] §7/ §e.cl    §fTeleporta N blocos acima",
-		"§b§l║ §e.server §7/ §e.srv     §fServidor atual",
-		"§b§l║ §e.stop           §fPara o proxy (confirme)",
-		"§b§l╚══════════════════════════════════════╝",
-	}
+	lines := s.engine.GetHelp()
 	for _, l := range lines {
 		s.sendMessage(l)
 	}
 }
 
 // ─────────────────────────────────────────────────────────────
-//  .fullbright
+//  .run <arquivo.lua>
 // ─────────────────────────────────────────────────────────────
 
-func (s *session) toggleFullbright() {
-	s.mu.Lock()
-	s.fullbrightOn = !s.fullbrightOn
-	on := s.fullbrightOn
-	s.mu.Unlock()
-
-	if on {
-		_ = s.client.WritePacket(&packet.MobEffect{
-			EntityRuntimeID: s.entityRuntimeID,
-			Operation:       packet.MobEffectAdd,
-			EffectType:      16, // Night Vision
-			Amplifier:       0,
-			Particles:       false,
-			Duration:        math.MaxInt32,
-		})
-		s.sendMessage("§a[Fullbright] §fVisão noturna §aATIVADA§f.")
-	} else {
-		_ = s.client.WritePacket(&packet.MobEffect{
-			EntityRuntimeID: s.entityRuntimeID,
-			Operation:       packet.MobEffectRemove,
-			EffectType:      16,
-		})
-		s.sendMessage("§c[Fullbright] §fVisão noturna §cDESATIVADA§f.")
-	}
-}
-
-// ─────────────────────────────────────────────────────────────
-//  .freecam
-// ─────────────────────────────────────────────────────────────
-
-func (s *session) toggleFreecam() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.freecamActive {
-		s.freecamActive = true
-		_ = s.client.WritePacket(&packet.SetPlayerGameType{GameType: 6})
-		s.sendMessage("§a[FreeCam] §fCâmera livre §aATIVADA§f. No servidor você está parado.")
-	} else {
-		s.freecamActive = false
-		_ = s.client.WritePacket(&packet.SetPlayerGameType{GameType: s.savedGameMode})
-		_ = s.server.WritePacket(&packet.MovePlayer{
-			EntityRuntimeID: s.entityRuntimeID,
-			Position:        s.savedPosition,
-			HeadYaw:         s.savedYaw,
-			Pitch:           s.savedPitch,
-			Mode:            packet.MoveModeTeleport,
-		})
-		s.sendMessage("§c[FreeCam] §fCâmera livre §cDESATIVADA§f. Você voltou para sua posição.")
-	}
-}
-
-// ─────────────────────────────────────────────────────────────
-//  .nochat
-// ─────────────────────────────────────────────────────────────
-
-func (s *session) toggleNochat() {
-	s.mu.Lock()
-	s.nochatOn = !s.nochatOn
-	on := s.nochatOn
-	s.mu.Unlock()
-
-	if on {
-		_ = s.client.WritePacket(&packet.SetTitle{ActionType: packet.TitleActionClear})
-		_ = s.client.WritePacket(&packet.SetTitle{ActionType: packet.TitleActionReset})
-		s.sendMessage("§a[NoChat] §fChat §aBLOQUEADO§f. Só mensagens do proxy aparecem.")
-	} else {
-		s.sendMessage("§c[NoChat] §fChat §cLIBERADO§f.")
-	}
-}
-
-// ─────────────────────────────────────────────────────────────
-//  .coords
-// ─────────────────────────────────────────────────────────────
-
-func (s *session) showCoords() {
-	s.mu.Lock()
-	pos := s.savedPosition
-	s.mu.Unlock()
-	s.sendMessage(fmt.Sprintf(
-		"§b[Coords] §fX: §e%.1f §fY: §e%.1f §fZ: §e%.1f",
-		pos.X(), pos.Y(), pos.Z(),
-	))
-}
-
-// ─────────────────────────────────────────────────────────────
-//  .ping
-// ─────────────────────────────────────────────────────────────
-
-func (s *session) showPing() {
-	// Mede RTT simples via tempo de WritePacket + ReadPacket
-	start := time.Now()
-	// Envia um NetworkStackLatency pro servidor e mede o tempo de resposta
-	_ = s.server.WritePacket(&packet.NetworkStackLatency{
-		Timestamp:     uint64(start.UnixMilli()),
-		NeedsResponse: true,
-	})
-	elapsed := time.Since(start)
-	s.sendMessage(fmt.Sprintf("§b[Ping] §f%d ms §7(estimado)", elapsed.Milliseconds()))
-}
-
-// ─────────────────────────────────────────────────────────────
-//  .time
-// ─────────────────────────────────────────────────────────────
-
-func (s *session) showTime() {
-	now := time.Now()
-	s.sendMessage(fmt.Sprintf(
-		"§b[Hora] §f%s §7(%s)",
-		now.Format("15:04:05"),
-		now.Format("02/01/2006"),
-	))
-}
-
-// ─────────────────────────────────────────────────────────────
-//  .uptime
-// ─────────────────────────────────────────────────────────────
-
-func (s *session) showUptime() {
-	d := time.Since(s.connectedAt).Round(time.Second)
-	h := int(d.Hours())
-	m := int(d.Minutes()) % 60
-	sec := int(d.Seconds()) % 60
-	s.sendMessage(fmt.Sprintf("§b[Uptime] §fConectado há §e%02d:%02d:%02d§f.", h, m, sec))
-}
-
-// ─────────────────────────────────────────────────────────────
-//  .clip [n]
-// ─────────────────────────────────────────────────────────────
-
-func (s *session) doClip(parts []string) {
-	blocks := float32(3.0) // padrão: 3 blocos acima
-	if len(parts) >= 2 {
-		var v float64
-		if _, err := fmt.Sscanf(parts[1], "%f", &v); err == nil {
-			blocks = float32(v)
-		}
-	}
-	if blocks > 256 {
-		s.sendMessage("§c[Clip] §fMáximo de 256 blocos por vez.")
+func (s *session) handleRun(args []string) {
+	if len(args) == 0 {
+		s.sendMessage("§c[Uso] §f.run §e<arquivo.lua>")
 		return
 	}
 
-	s.mu.Lock()
-	pos := s.savedPosition
-	s.mu.Unlock()
+	path := args[0]
+	if !strings.HasSuffix(path, ".lua") {
+		path += ".lua"
+	}
 
-	newPos := mgl32.Vec3{pos.X(), pos.Y() + blocks, pos.Z()}
+	id, err := s.engine.RunFile(path, s)
+	if err != nil {
+		s.sendMessage(fmt.Sprintf("§c[Script] §fErro ao carregar §e%s§f: §c%v", path, err))
+		return
+	}
 
-	// Teleporta no servidor
-	_ = s.server.WritePacket(&packet.MovePlayer{
-		EntityRuntimeID: s.entityRuntimeID,
-		Position:        newPos,
-		Mode:            packet.MoveModeTeleport,
-	})
-	// Atualiza cliente também
-	_ = s.client.WritePacket(&packet.MovePlayer{
-		EntityRuntimeID: s.entityRuntimeID,
-		Position:        newPos,
-		Mode:            packet.MoveModeTeleport,
-	})
-
-	s.mu.Lock()
-	s.savedPosition = newPos
-	s.mu.Unlock()
-
-	s.sendMessage(fmt.Sprintf("§a[Clip] §fTeleportado §e%.0f§f blocos acima. Novo Y: §e%.1f", blocks, newPos.Y()))
+	s.sendMessage(fmt.Sprintf("§a[Script] §fScript §e%s§f carregado! §aID: #%d", path, id))
 }
 
 // ─────────────────────────────────────────────────────────────
-//  .server
+//  .debug <arquivo.lua>
 // ─────────────────────────────────────────────────────────────
 
-func (s *session) showServer() {
-	s.sendMessage(fmt.Sprintf("§b[Server] §f%s §7— §f%s", s.srvInfo.Name, s.srvInfo.Address))
+func (s *session) handleDebug(args []string) {
+	if len(args) == 0 {
+		s.sendMessage("§c[Uso] §f.debug §e<arquivo.lua>")
+		return
+	}
+
+	path := args[0]
+	if !strings.HasSuffix(path, ".lua") {
+		path += ".lua"
+	}
+
+	id, err := s.engine.RunFileDebug(path, s)
+	if err != nil {
+		s.sendMessage(fmt.Sprintf("§c[Debug] §fErro ao carregar §e%s§f: §c%v", path, err))
+		return
+	}
+
+	s.sendMessage(fmt.Sprintf("§a[Debug] §fScript §e%s§f em execução! §aID: #%d", path, id))
 }
 
 // ─────────────────────────────────────────────────────────────
-//  .stop
+//  .ids
 // ─────────────────────────────────────────────────────────────
 
-func (s *session) handleStop() {
+func (s *session) handleIds() {
+	scripts := s.engine.GetActiveScripts()
+
+	if len(scripts) == 0 {
+		s.sendMessage("§e[Scripts] §fNenhum script ativo.")
+		return
+	}
+
+	s.sendMessage("§b§l╔══════════════════════════════════════╗")
+	s.sendMessage("§b§l║         §eScripts Ativos                  §b§l║")
+	s.sendMessage("§b§l╠══════════════════════════════════════╣")
+	for _, sc := range scripts {
+		s.sendMessage(fmt.Sprintf(
+			"§b§l║ §a#%d §f%-20s §7Cmds:%d Hooks:%d",
+			sc.ID, sc.Name, sc.Commands, sc.Hooks,
+		))
+	}
+	s.sendMessage("§b§l╠══════════════════════════════════════╣")
+	s.sendMessage("§b§l║ §e.stop §7<id> §fpara parar um script")
+	s.sendMessage("§b§l╚══════════════════════════════════════╝")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  .stop [id]
+// ─────────────────────────────────────────────────────────────
+
+func (s *session) handleStopCommand(args []string) {
+	// .stop sem argumentos = parar o proxy
+	if len(args) == 0 {
+		s.handleStopProxy()
+		return
+	}
+
+	// .stop <id> = parar script
+	idStr := args[0]
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		s.sendMessage(fmt.Sprintf("§c[Stop] §fID inválido: §e%s§f. Use §e.ids§f para ver os IDs.", idStr))
+		return
+	}
+
+	if !s.engine.IsScriptRunning(id) {
+		s.sendMessage(fmt.Sprintf("§c[Stop] §fScript §e#%d§f não está rodando.", id))
+		return
+	}
+
+	if s.engine.StopScript(id) {
+		s.sendMessage(fmt.Sprintf("§a[Stop] §fScript §e#%d§f parado com sucesso!", id))
+	} else {
+		s.sendMessage(fmt.Sprintf("§c[Stop] §fErro ao parar script §e#%d§f.", id))
+	}
+}
+
+// ─────────────────────────────────────────────────────────────
+//  .stop (parar o proxy)
+// ─────────────────────────────────────────────────────────────
+
+func (s *session) handleStopProxy() {
 	if !s.stopping.Load() {
 		s.stopping.Store(true)
 		s.sendMessage("§e[Stop] §fDigite §c.stop§f novamente em §c10 segundos§f para confirmar.")
@@ -515,6 +465,7 @@ func (s *session) handleStop() {
 		s.stopTimer.Stop()
 	}
 	s.sendMessage("§c[Stop] §fEncerrando o proxy... Até mais!")
+	s.engine.Clear()
 	time.Sleep(500 * time.Millisecond)
 	_ = s.client.Close()
 	_ = s.server.Close()
