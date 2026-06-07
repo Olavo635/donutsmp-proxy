@@ -1,4 +1,4 @@
-module github.com/Olavo635/donutsmp-proxy
+module github.com/Olavo635/plproxy
 
 go 1.24
 
