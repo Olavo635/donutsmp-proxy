@@ -1,6 +1,6 @@
-# 🍩 Donut Proxy
+# 🚀 Pl Proxy
 
-Proxy MITM para Minecraft Bedrock Edition focado em jogadores do **donutsmp.net**. 
+Proxy MITM para Minecraft Bedrock Edition com funções QOL
 
 ## Funcionalidades
 
@@ -10,6 +10,12 @@ Proxy MITM para Minecraft Bedrock Edition focado em jogadores do **donutsmp.net*
 | `.fullbright` | `.fb` | Toggle de visão noturna (só no seu client) |
 | `.freecam` | `.fc` | Toggle câmera livre (você fica parado no server) |
 | `.stop` | — | Para o proxy (requer confirmação em 10s) |
+| `.coords` | `.co` | Mostra X, Y, Z atual |
+| `.ping` | — | Ping estimado com o servidor |
+| `.time` | `.hora` | Hora e data do sistema |
+| `.uptime` | `.up` | Tempo conectado na sessão |
+| `.clip [n]` | `.cl` | Teleporta N blocos acima (padrão 3, máx 256) |
+| `.server` | `.srv` | Mostra servidor atual e endereço |
 
 ### Como o FreeCam funciona
 - Ao ativar: o proxy muda seu gamemode para **Spectator** localmente. No servidor, você fica **parado no lugar** (inputs de movimento bloqueados).  
