@@ -20,17 +20,14 @@ const (
 	localAddress  = "0.0.0.0:19132"
 )
 
-// Proxy é o proxy principal do Donut Proxy.
 type Proxy struct {
 	src oauth2.TokenSource
 }
 
-// New cria um novo Proxy.
 func New(src oauth2.TokenSource) *Proxy {
 	return &Proxy{src: src}
 }
 
-// Start inicia o listener local e começa a aceitar conexões.
 func (p *Proxy) Start() error {
 	status, err := minecraft.NewForeignStatusProvider(remoteAddress)
 	if err != nil {
@@ -58,7 +55,6 @@ func (p *Proxy) Start() error {
 	}
 }
 
-// handleConn gerencia uma conexão individual do cliente.
 func (p *Proxy) handleConn(client *minecraft.Conn, listener *minecraft.Listener) {
 	serverConn, err := minecraft.Dialer{
 		TokenSource: p.src,
@@ -97,20 +93,21 @@ func (p *Proxy) handleConn(client *minecraft.Conn, listener *minecraft.Listener)
 	}
 
 	fmt.Println("[proxy] Jogador conectado!")
-
-	session := newSession(client, serverConn, listener)
-	session.run()
+	newSession(client, serverConn, listener).run()
 }
 
-// session representa a sessão ativa de um jogador.
+// ─────────────────────────────────────────────────────────────
+//  session
+// ─────────────────────────────────────────────────────────────
+
 type session struct {
 	client   *minecraft.Conn
 	server   *minecraft.Conn
 	listener *minecraft.Listener
 
-	mu          sync.Mutex
-	stopping    atomic.Bool
-	stopTimer   *time.Timer
+	mu        sync.Mutex
+	stopping  atomic.Bool
+	stopTimer *time.Timer
 
 	// freecam
 	freecamActive bool
@@ -120,7 +117,10 @@ type session struct {
 	// fullbright
 	fullbrightOn bool
 
-	// runtime ID do jogador (do StartGame)
+	// nochat
+	nochatOn bool
+
+	// runtime ID do jogador
 	entityRuntimeID uint64
 }
 
@@ -135,7 +135,6 @@ func newSession(client *minecraft.Conn, server *minecraft.Conn, listener *minecr
 	}
 }
 
-// run inicia as goroutines de leitura bidirecional.
 func (s *session) run() {
 	done := make(chan struct{}, 2)
 
@@ -151,7 +150,6 @@ func (s *session) run() {
 				continue
 			}
 			if s.freecamActive {
-				// Bloqueia inputs de movimento/ação enquanto freecam está ativo
 				switch pk.(type) {
 				case *packet.MovePlayer,
 					*packet.PlayerAuthInput,
@@ -178,7 +176,10 @@ func (s *session) run() {
 			if err != nil {
 				return
 			}
-			s.handleServerPacket(pk)
+			if s.handleServerPacket(pk) {
+				// pacote bloqueado pelo proxy, não encaminha
+				continue
+			}
 			if err := s.client.WritePacket(pk); err != nil {
 				return
 			}
@@ -194,7 +195,6 @@ func (s *session) run() {
 func (s *session) handleClientPacket(pk packet.Packet) bool {
 	switch p := pk.(type) {
 	case *packet.Text:
-		// TextTypeChat = 1 (constante do pacote)
 		if p.TextType == packet.TextTypeChat && strings.HasPrefix(p.Message, ".") {
 			s.handleCommand(p.Message)
 			return true
@@ -215,8 +215,8 @@ func (s *session) handleClientPacket(pk packet.Packet) bool {
 	return false
 }
 
-// handleServerPacket observa pacotes do servidor para manter estado.
-func (s *session) handleServerPacket(pk packet.Packet) {
+// handleServerPacket processa pacotes do servidor. Retorna true se o pacote deve ser bloqueado.
+func (s *session) handleServerPacket(pk packet.Packet) bool {
 	switch p := pk.(type) {
 	case *packet.SetPlayerGameType:
 		if !s.freecamActive {
@@ -224,45 +224,53 @@ func (s *session) handleServerPacket(pk packet.Packet) {
 			s.savedGameMode = p.GameType
 			s.mu.Unlock()
 		}
+	case *packet.Text:
+		s.mu.Lock()
+		nochat := s.nochatOn
+		s.mu.Unlock()
+		if nochat && p.TextType != packet.TextTypeSystem {
+			return true // bloqueia chat, whispers, anuncios, etc
+		}
 	}
+	return false
 }
 
-// handleCommand processa um comando proxy (iniciado com ".").
+// ─────────────────────────────────────────────────────────────
+//  Comandos
+// ─────────────────────────────────────────────────────────────
+
 func (s *session) handleCommand(raw string) {
 	parts := strings.Fields(strings.ToLower(raw))
 	if len(parts) == 0 {
 		return
 	}
-	cmd := parts[0]
-
-	switch cmd {
+	switch parts[0] {
 	case ".help", ".ajuda":
 		s.sendHelp()
 	case ".fullbright", ".fb":
 		s.toggleFullbright()
 	case ".freecam", ".fc":
 		s.toggleFreecam()
+	case ".nochat", ".nc":
+		s.toggleNochat()
 	case ".stop":
 		s.handleStop()
 	default:
-		s.sendMessage(fmt.Sprintf("§cComando desconhecido: %s — use §e.ajuda§c para ver a lista.", cmd))
+		s.sendMessage(fmt.Sprintf("§cComando desconhecido: %s — use §e.ajuda§c para ver a lista.", parts[0]))
 	}
 }
 
-// ─────────────────────────────────────────────────────────────
-//  .ajuda
-// ─────────────────────────────────────────────────────────────
-
 func (s *session) sendHelp() {
 	lines := []string{
-		"§b§l╔══════════════════════════════════╗",
-		"§b§l║      §eDONUT PROXY §b— Comandos      §b§l║",
-		"§b§l╠══════════════════════════════════╣",
-		"§b§l║ §e.help §7/ §e.ajuda    §fMostra esta tela",
-		"§b§l║ §e.fullbright §7/ §e.fb §fToggle visão noturna",
-		"§b§l║ §e.freecam §7/ §e.fc   §fToggle câmera livre",
-		"§b§l║ §e.stop          §fPara o proxy (confirme)",
-		"§b§l╚══════════════════════════════════╝",
+		"§b§l╔════════════════════════════════════╗",
+		"§b§l║       §eDONUT PROXY §b— Comandos       §b§l║",
+		"§b§l╠════════════════════════════════════╣",
+		"§b§l║ §e.help §7/ §e.ajuda     §fMostra esta tela",
+		"§b§l║ §e.fullbright §7/ §e.fb  §fToggle visão noturna",
+		"§b§l║ §e.freecam §7/ §e.fc    §fToggle câmera livre",
+		"§b§l║ §e.nochat §7/ §e.nc     §fToggle silenciar chat",
+		"§b§l║ §e.stop           §fPara o proxy (confirme)",
+		"§b§l╚════════════════════════════════════╝",
 	}
 	for _, l := range lines {
 		s.sendMessage(l)
@@ -306,7 +314,6 @@ func (s *session) toggleFullbright() {
 func (s *session) toggleFreecam() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if !s.freecamActive {
 		s.enableFreecam()
 	} else {
@@ -316,23 +323,36 @@ func (s *session) toggleFreecam() {
 
 func (s *session) enableFreecam() {
 	s.freecamActive = true
-	_ = s.client.WritePacket(&packet.SetPlayerGameType{
-		GameType: 6, // spectator
-	})
+	_ = s.client.WritePacket(&packet.SetPlayerGameType{GameType: 6})
 	s.sendMessage("§a[FreeCam] §fCâmera livre §aATIVADA§f. No servidor você está parado.")
 }
 
 func (s *session) disableFreecam() {
 	s.freecamActive = false
-	_ = s.client.WritePacket(&packet.SetPlayerGameType{
-		GameType: s.savedGameMode,
-	})
+	_ = s.client.WritePacket(&packet.SetPlayerGameType{GameType: s.savedGameMode})
 	_ = s.server.WritePacket(&packet.MovePlayer{
 		EntityRuntimeID: s.entityRuntimeID,
 		Position:        s.savedPosition,
 		Mode:            packet.MoveModeTeleport,
 	})
 	s.sendMessage("§c[FreeCam] §fCâmera livre §cDESATIVADA§f. Você voltou para sua posição.")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  .nochat
+// ─────────────────────────────────────────────────────────────
+
+func (s *session) toggleNochat() {
+	s.mu.Lock()
+	s.nochatOn = !s.nochatOn
+	on := s.nochatOn
+	s.mu.Unlock()
+
+	if on {
+		s.sendMessage("§a[NoChat] §fChat do servidor §aBLOQUEADO§f. Só mensagens do proxy aparecem.")
+	} else {
+		s.sendMessage("§c[NoChat] §fChat do servidor §cLIBERADO§f.")
+	}
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -343,14 +363,12 @@ func (s *session) handleStop() {
 	if !s.stopping.Load() {
 		s.stopping.Store(true)
 		s.sendMessage("§e[Stop] §fDigite §c.stop§f novamente em §c10 segundos§f para confirmar.")
-
 		s.stopTimer = time.AfterFunc(10*time.Second, func() {
 			s.stopping.Store(false)
 			s.sendMessage("§e[Stop] §fCancelado — tempo expirado.")
 		})
 		return
 	}
-
 	if s.stopTimer != nil {
 		s.stopTimer.Stop()
 	}
@@ -363,7 +381,7 @@ func (s *session) handleStop() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Utilitários
+//  Util
 // ─────────────────────────────────────────────────────────────
 
 func (s *session) sendMessage(msg string) {
