@@ -34,18 +34,18 @@ Aplica o efeito Night Vision **somente no seu client**. O servidor não vê nada
 ## Instalação
 
 ```bash
-git clone https://github.com/Olavo635/donutsmp-proxy
-cd donutsmp-proxy
+git clone https://github.com/Olavo635/plproxy
+cd plproxy
 go mod tidy
-go build -o donut-proxy .
+go build -o plproxy .
 ```
 
 ## Uso
 
 1. **Execute o proxy:**
    ```bash
-   cd ~/donutsmp-proxy
-   ./donut-proxy
+   cd ~/plproxy
+   ./plproxy
    ```
 2. Na **primeira execução**, ele abrirá um link no terminal para autenticação Microsoft. Faça login e copie o código.
 3. O token é salvo em `token.json` — nas próximas execuções o login é automático.
@@ -57,7 +57,7 @@ go build -o donut-proxy .
 ## Estrutura do Projeto
 
 ```
-donut-proxy/
+plproxy/
 ├── main.go          # Entrypoint, autenticação, persistência de token
 ├── proxy/
 │   └── proxy.go     # Listener, session, interceptação de pacotes e comandos
