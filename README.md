@@ -29,7 +29,7 @@ Aplica o efeito Night Vision **somente no seu client**. O servidor não vê nada
 ## Instalação
 
 ```bash
-git clone https://github.com/user/donut-proxy
+git clone https://github.com/Olavo635/donutsmp-proxy
 cd donut-proxy
 go mod tidy
 go build -o donut-proxy .
